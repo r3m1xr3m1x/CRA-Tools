@@ -1,44 +1,79 @@
 name: Build Android APK
-
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
+      - name: Extract versioned project and validation tools
+        run: unzip -o CRA_Tools_Android_Project.zip
       - name: Set up Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
-
-      - name: Install Android SDK packages
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Validate tax engine and source verification
+        run: npm test
+      - name: Install UI test dependencies
         run: |
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-35" "build-tools;35.0.0"
-
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Test both workflows with fictional returns
+        run: npm run test:ui
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
-
-      - name: Extract Android project
-        run: unzip -o CRA_Tools_Android_Project.zip
-
-      - name: Build APK
+      - name: Install Android SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
+      - name: Build and lint
         working-directory: CRA_Tools_Android
-        run: gradle assembleDebug
-
-      - name: Upload APK
+        run: gradle --no-daemon assembleDebug lintDebug assembleDebugAndroidTest
+      - name: Enable emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Test native OCR on fictional return image
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 29
+          arch: x86_64
+          target: default
+          disable-animations: true
+          script: cd CRA_Tools_Android && gradle --no-daemon connectedDebugAndroidTest
+      - name: Verify installable APK signature
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose CRA_Tools_Android/app/build/outputs/apk/debug/app-debug.apk
+          mkdir -p dist
+          cp CRA_Tools_Android/app/build/outputs/apk/debug/app-debug.apk dist/CRA-Tools-v3.apk
+          sha256sum dist/CRA-Tools-v3.apk > dist/SHA256SUMS.txt
+      - name: Upload final APK
         uses: actions/upload-artifact@v4
         with:
           name: CRA-Tools-APK
-          path: CRA_Tools_Android/app/build/outputs/apk/debug/app-debug.apk
+          path: dist/*
+      - name: Upload verification reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CRA-Tools-validation
+          path: |
+            test-output/
+            CRA_Tools_Android/app/build/reports/
+            CRA_Tools_Android/app/build/outputs/androidTest-results/
